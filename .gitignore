@@ -1,0 +1,9 @@
+neumooc_token.json
+neumooc_credentials.json
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+tests/_tmp_run/
