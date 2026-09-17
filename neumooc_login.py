@@ -763,6 +763,13 @@ class NeumoocClient:
             body=dict(payload),
         )
 
+    def teacher_makeup_attendance(self, payload: Mapping[str, Any]) -> Any:
+        """教师手动补签；服务端会校验当前账号的教师权限。"""
+        return self.request_api(
+            "PUT", f"{WEB_API}/teachmanager/teach-course-attendance-detail/update",
+            body=dict(payload),
+        )
+
     # Web 学生端补充接口：查询未签到数量 / 当前待签到考勤（按教学班维度）
     def get_sign_num(self, student_id: Any, teach_class_id: Any) -> Any:
         return self.request_api(
@@ -1331,6 +1338,29 @@ def cmd_publish_attendance(args: argparse.Namespace) -> None:
     _print_result(result)
 
 
+def _teacher_makeup_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "attendanceId": args.attendance_id,
+        "id": args.detail_id,
+        "status": 1,
+        "type": args.type,
+        "signRole": 3,
+        "signUserId": args.student_id,
+    }
+
+
+def cmd_teacher_makeup(args: argparse.Namespace) -> None:
+    payload = _teacher_makeup_payload(args)
+    if args.dry_run:
+        print("[DRY-RUN] 未发送请求，生成的教师补签参数：")
+        _print_result(payload)
+        return
+    client = _build_client(args)
+    result = client.teacher_makeup_attendance(payload)
+    print("[OK] 教师补签成功")
+    _print_result(result)
+
+
 def cmd_auto_checkin(args: argparse.Namespace) -> None:
     """学生端自动签到：轮询进行中的考勤并直接发包提交（详见 neumooc_checkin 模块）。"""
     from neumooc_checkin import AutoCheckinBot, CheckinError
@@ -1452,6 +1482,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_publish_attendance)
 
     p = sub.add_parser(
+        "teacher-makeup",
+        help="使用教师权限为指定学生补签（服务端校验教师权限）",
+    )
+    p.add_argument("--attendance-id", required=True, help="考勤活动 ID")
+    p.add_argument("--detail-id", required=True, help="学生考勤明细 ID")
+    p.add_argument("--student-id", required=True, help="目标学生用户 ID")
+    p.add_argument("--type", type=int, choices=(0, 1, 2), default=0,
+                   help="签到类型：0 普通，1 二维码，2 教师考勤（默认 0）")
+    p.add_argument("--dry-run", action="store_true", help="只打印参数，不实际补签")
+    p.set_defaults(func=cmd_teacher_makeup)
+
+    p = sub.add_parser(
         "auto-checkin",
         help="学生端自动签到：轮询进行中的考勤并直接发包提交（ATT-01/03/05）",
     )
@@ -1470,7 +1512,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-teacher", action="store_true",
                    help="教师考勤(type=2)也尝试签到（默认跳过）")
     p.add_argument("--any-status", action="store_true",
-                   help="不过滤考勤状态（默认只查进行中 status=1）")
+                   help="处理所有考勤状态（默认跳过明确未开始/已结束的场次）")
     p.add_argument("--page-size", type=int,
                    help="ATT-01 分页大小（默认不传，使用服务端默认）")
     p.add_argument("--max-attempts", type=int, default=3,

@@ -69,7 +69,9 @@ from neumooc_login import ApiError, NeumoocClient
 # 常量区（联调时按需调整）
 # ============================================================
 # 考勤场次状态（Web 学生端映射）
+SESSION_STATUS_NOT_STARTED = 0
 SESSION_STATUS_IN_PROGRESS = 1
+SESSION_STATUS_ENDED = 2
 
 # 签到类型
 ATTENDANCE_TYPE_NORMAL = 0
@@ -290,7 +292,7 @@ class AutoCheckinBot:
     :param qr_sign_type: 二维码考勤(type=1)直接发包签到时的提交体 type
         （默认 1，附带 refreshSeed="0" 与默认坐标；仍被拒绝时可改 0）
     :param include_teacher: 教师考勤（type=2）也尝试签到
-    :param any_status: 不过滤场次状态（默认只查进行中 status=1）
+    :param any_status: 处理所有场次状态（默认跳过明确未开始/已结束的场次）
     :param dry_run: 只打印将要提交的数据
     :param max_attempts: 每场考勤失败重试上限
     :param max_rounds: 最大轮询轮数；None 表示不限（Ctrl+C 停止）
@@ -377,7 +379,9 @@ class AutoCheckinBot:
             "termId": self.term_id,
             "courseId": self.course_id,
             "attendanceStatus": None,
-            "status": None if self.any_status else SESSION_STATUS_IN_PROGRESS,
+            # 新发布且进行中的考勤可能返回 status=null，服务端按 status=1
+            # 过滤会漏掉它，因此拉取全部记录后在本地过滤明确的 0/2。
+            "status": None,
         }
         if self.page_size:
             body.update({"pageNo": 1, "pageSize": self.page_size})
@@ -397,6 +401,13 @@ class AutoCheckinBot:
     def _process(self, task: SignTask, counts: Dict[str, int]) -> None:
         if task.signed:
             counts["signed"] += 1
+            return
+        if not self.any_status and task.session_status in (
+            SESSION_STATUS_NOT_STARTED,
+            SESSION_STATUS_ENDED,
+        ):
+            self._skip(task, f"考勤状态为 {task.session_status}，不是进行中场次")
+            counts["skip"] += 1
             return
         state = self.attempted.get(task.key)
         if state == "done":

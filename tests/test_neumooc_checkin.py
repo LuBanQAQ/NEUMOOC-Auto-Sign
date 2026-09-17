@@ -15,7 +15,7 @@ from neumooc_checkin import (
     extract_page_items,
     resolve_current_term,
 )
-from neumooc_login import NeumoocClient, build_parser
+from neumooc_login import NeumoocClient, _teacher_makeup_payload, build_parser
 
 # 不用 tempfile.mkdtemp：其 0700 限制性 ACL 在部分受控环境下无法写入
 _TEMP_ROOT = Path(__file__).resolve().parent / "_tmp_run"
@@ -299,15 +299,29 @@ class BotTests(CheckinTestCase):
         self.assertEqual(counts["ok"], 0)
         self.assertNotIn(("PUT", UPDATE_URL), bot.client.http.urls())
 
-    def test_scan_filters_in_progress_status(self):
+    def test_scan_fetches_all_statuses_to_include_null_status(self):
         bot = self.make_bot([])
         bot.scan_once()
-        self.assertEqual(bot.client.http.last_json()["status"], 1)
+        self.assertIsNone(bot.client.http.last_json()["status"])
         self.assertEqual(bot.client.http.last_json()["termId"], "term-1")
 
         bot_any = self.make_bot([], any_status=True)
         bot_any.scan_once()
         self.assertIsNone(bot_any.client.http.last_json()["status"])
+
+    def test_scan_accepts_pending_row_with_null_status(self):
+        bot = self.make_bot([{**ROW_QR, "status": None}])
+        counts = bot.scan_once()
+        self.assertEqual(counts["ok"], 1)
+
+    def test_scan_skips_explicit_not_started_and_ended_rows(self):
+        bot = self.make_bot([
+            {**ROW_NORMAL, "id": "detail-0", "status": 0},
+            {**ROW_NORMAL, "id": "detail-2", "status": 2},
+        ])
+        counts = bot.scan_once()
+        self.assertEqual(counts["skip"], 2)
+        self.assertNotIn(("PUT", UPDATE_URL), bot.client.http.urls())
 
     def test_dry_run_never_submits(self):
         bot = self.make_bot([ROW_NORMAL], dry_run=True)
@@ -475,6 +489,28 @@ class ParserTests(CheckinTestCase):
         self.assertEqual(args.interval, 30)
         self.assertFalse(args.once)
         self.assertIsNone(args.max_rounds)
+
+    def test_teacher_makeup_payload_and_parser(self):
+        args = build_parser().parse_args([
+            "teacher-makeup", "--attendance-id", "att-1",
+            "--detail-id", "detail-1", "--student-id", "stu-1",
+            "--type", "1", "--dry-run",
+        ])
+        self.assertEqual(_teacher_makeup_payload(args), {
+            "attendanceId": "att-1", "id": "detail-1", "status": 1,
+            "type": 1, "signRole": 3, "signUserId": "stu-1",
+        })
+        self.assertTrue(args.dry_run)
+
+    def test_teacher_makeup_uses_attendance_update_route(self):
+        client = self.make_client([FakeResponse({})])
+        payload = {
+            "attendanceId": "att-1", "id": "detail-1", "status": 1,
+            "type": 0, "signRole": 3, "signUserId": "stu-1",
+        }
+        client.teacher_makeup_attendance(payload)
+        self.assertEqual(client.http.urls()[-1], ("PUT", UPDATE_URL))
+        self.assertEqual(client.http.last_json(), payload)
 
     def test_client_sign_record_methods_use_web_routes(self):
         client = self.make_client()
