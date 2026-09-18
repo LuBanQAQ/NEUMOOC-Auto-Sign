@@ -88,7 +88,25 @@ class NeumoocClientTests(unittest.TestCase):
         self.assertEqual(kwargs["json"], [1, 2])
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer access")
         self.assertEqual(kwargs["headers"]["Tenant-Id"], "12")
-        self.assertEqual(len(kwargs["headers"]["Id-Code"]), 32)
+        # Id-Code = base64(AES-CBC(key=iv="neuedu_nse_12345", 零填充("{userId}_{uuid}_{path}")))
+        self.assert_id_code(
+            kwargs["headers"]["Id-Code"],
+            "/web-api/system/notify-target/update-read",
+        )
+
+    def assert_id_code(self, code: str, path: str) -> None:
+        """解密 Id-Code 回验：明文应为 {用户ID}_{uuid}_{请求路径}。"""
+        import base64 as _b64
+
+        from Crypto.Cipher import AES  # type: ignore
+
+        raw = AES.new(
+            b"neuedu_nse_12345", AES.MODE_CBC, b"neuedu_nse_12345"
+        ).decrypt(_b64.b64decode(code))
+        text = raw.rstrip(b"\x00").decode("utf-8")
+        self.assertTrue(text.startswith("0_"), text)
+        self.assertTrue(text.endswith(path), text)
+        self.assertEqual(len(text.split("_")[1]), 36)   # uuid
 
     def test_representative_routes_from_all_groups(self):
         client = self.make_client()

@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import sys
@@ -92,6 +93,32 @@ USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 uni-app"
 )
+
+
+ID_CODE_KEY = b"neuedu_nse_12345"   # AES key 与 IV 相同（来自用户脚本逆向）
+
+
+def _aes_cbc_zero_padding_b64(text: str) -> Optional[str]:
+    """AES-CBC(key=iv=ID_CODE_KEY) + 零填充 + base64；无可用加密库时返回 None。"""
+    raw = text.encode("utf-8")
+    block = 16
+    padded_len = ((len(raw) + block - 1) // block) * block or block
+    padded = raw + b"\x00" * (padded_len - len(raw))
+    try:  # pycryptodome
+        from Crypto.Cipher import AES  # type: ignore
+
+        return base64.b64encode(
+            AES.new(ID_CODE_KEY, AES.MODE_CBC, ID_CODE_KEY).encrypt(padded)
+        ).decode("ascii")
+    except ImportError:
+        pass
+    try:  # cryptography
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
+
+        enc = Cipher(algorithms.AES(ID_CODE_KEY), modes.CBC(ID_CODE_KEY)).encryptor()
+        return base64.b64encode(enc.update(padded) + enc.finalize()).decode("ascii")
+    except ImportError:
+        return None
 
 
 class ApiError(Exception):
@@ -252,9 +279,16 @@ class NeumoocClient:
     # 请求核心（文档第 3 节公共约定）
     # ------------------------------------------------------------
     def _id_code(self, path: str) -> str:
-        """Id-Code：官方客户端动态生成，算法未公开。
-        按文档描述与「用户 ID + 随机请求 ID + 接口路径」相关，此处生成 32 位十六进制占位值。"""
-        seed = f"{self.user_id if self.user_id is not None else 0}|{uuid.uuid4()}|{path}"
+        """Id-Code：AES-CBC + 零填充，明文 ``{userId}_{uuid}_{path}``。
+
+        参考油猴脚本「NEUMOOC 智能助手」：key 与 iv 同为 ``neuedu_nse_12345``，
+        采用**零填充**（长度正好是 16 的倍数时不额外补块），结果 base64。
+        缺少加密库时退回旧的 md5 占位值。
+        """
+        seed = f"{self.user_id if self.user_id is not None else 0}_{uuid.uuid4()}_{path}"
+        code = _aes_cbc_zero_padding_b64(seed)
+        if code:
+            return code
         return hashlib.md5(seed.encode("utf-8")).hexdigest()
 
     def _url(self, path: str, *, base: Optional[str] = None) -> str:
@@ -789,6 +823,19 @@ class NeumoocClient:
             "GET", f"{WEB_API}/teachmanager/teach-course-attendance/page", params=params
         )
 
+    def get_teacher_attendance(self, params: Mapping[str, Any]) -> Any:
+        """考勤主表详情（教师端）：GET teach-course-attendance/get。"""
+        return self.request_api(
+            "GET", f"{WEB_API}/teachmanager/teach-course-attendance/get", params=params
+        )
+
+    def update_teacher_attendance(self, payload: Mapping[str, Any]) -> Any:
+        """考勤主表更新（教师端）：可改 status / finishTime，用于临时重开或恢复结束。"""
+        return self.request_api(
+            "PUT", f"{WEB_API}/teachmanager/teach-course-attendance/update",
+            body=dict(payload),
+        )
+
     def publish_attendance(self, payload: Mapping[str, Any]) -> Any:
         """发布普通、定位或二维码签到；payload 字段由教师端页面定义。"""
         return self.request_api(
@@ -964,6 +1011,8 @@ def _print_status(client: NeumoocClient) -> None:
     print("  4. 查看用户资料(USR-01)      5. 刷新访问令牌(AUTH-05)")
     print("  6. 修改业务域名              7. 清除本地登录信息")
     print("  8. 启动自动签到(学生端)")
+    print("  9. 教师接口强制补签(学生账号)")
+    print(" 10. 列出本学期课程(查课程ID)")
     print("  0. 退出")
 
 
@@ -1073,6 +1122,88 @@ def _act_auto_checkin(client: NeumoocClient) -> None:
     bot.run()
 
 
+def _print_courses(client: NeumoocClient, term_id: Optional[str] = None) -> None:
+    """列出该学期课程及其 teachCourseId（即 --course-id 要填的值）。"""
+    from neumooc_checkin import resolve_current_term
+
+    if not client.access_token:
+        print("[!] 尚未登录，请先登录（菜单 1/2）")
+        return
+    if term_id is None:
+        terms = client.get_term_options()
+        items = terms if isinstance(terms, list) else []
+        term = resolve_current_term([t for t in items if isinstance(t, dict)])
+        if term is None:
+            print("[!] 未能识别当前学期，请用 courses --term-id 手动指定")
+            return
+        term_id = term.get("id")
+        print(f"当前学期：{term.get('name')}（teachTermId={term_id}）")
+    data = client.get_course_options_by_term({"termId": term_id})
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        rows = [item for item in data if isinstance(item, dict)]
+    elif isinstance(data, dict):
+        for key in ("list", "records", "rows", "data"):
+            if isinstance(data.get(key), list):
+                rows = [item for item in data[key] if isinstance(item, dict)]
+                break
+    if not rows:
+        print("未查到课程，请加 --debug 查看原始返回，或确认学期 ID 是否正确")
+        return
+    print(f"共 {len(rows)} 门课程（--course-id 填 teachCourseId 的值）：")
+    for item in rows:
+        cid = _first(item, ("teachCourseId", "courseId", "id"))
+        name = _first(item, ("teachCourseName", "courseName", "name"))
+        code = _first(item, ("courseCode", "teachCourseCode"))
+        line = f"  teachCourseId={cid}\t课程={name}"
+        if code is not None:
+            line += f"\t编码={code}"
+        print(line)
+
+
+def _act_courses(client: NeumoocClient) -> None:
+    """菜单 10：列出本学期课程及课程 ID"""
+    _print_courses(client)
+
+
+def _act_force_checkin(client: NeumoocClient) -> None:
+    """菜单 9：教师接口强制补签（Ctrl+C 返回菜单）"""
+    from neumooc_checkin import ForceCheckinBot
+
+    print("提示：课程 ID 就是列表里的 teachCourseId；不确定可先用菜单 10 查看，"
+          "直接回车则扫描该学期全部课程。")
+    print("      学生形态被拒（如“考勤已结束”）时会自动改用教师补签形态"
+          "（signRole=3）重试一次。")
+    raw = _input("只补签的课程 ID（可留空=该学期全部课程）：", required=False)
+    course_ids = [raw] if raw else None
+    raw = _input("扫描间隔秒数（回车默认 5）：", required=False)
+    interval = 5
+    if raw:
+        try:
+            interval = max(1, int(raw))
+        except ValueError:
+            print("[!] 不是数字，使用默认 5 秒")
+    raw = _input("是否也补签最近已结束的场次？(y/N，服务端一般会拒绝)：",
+                 required=False, default="n")
+    include_ended = bool(raw) and raw.strip().lower() in ("y", "yes")
+    ended_within = 120
+    if include_ended:
+        raw = _input("只补签最近多少分钟内结束的场次（回车默认 120）：", required=False)
+        if raw:
+            try:
+                ended_within = max(1, int(raw))
+            except ValueError:
+                print("[!] 不是数字，使用默认 120 分钟")
+    bot = ForceCheckinBot(
+        client,
+        interval=interval,
+        course_ids=course_ids,
+        include_ended=include_ended,
+        ended_within_minutes=ended_within,
+    )
+    bot.run()
+
+
 def run_interactive(args: argparse.Namespace) -> int:
     client = _build_client(args)
     print("已进入交互模式：输入菜单编号并回车；任意输入环节可按 Ctrl+C 取消并返回菜单。")
@@ -1089,6 +1220,8 @@ def run_interactive(args: argparse.Namespace) -> int:
         "6": _act_website,
         "7": _act_logout,
         "8": _act_auto_checkin,
+        "9": _act_force_checkin,
+        "10": _act_courses,
     }
     while True:
         _print_status(client)
@@ -1339,7 +1472,7 @@ def cmd_publish_attendance(args: argparse.Namespace) -> None:
 
 
 def _teacher_makeup_payload(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "attendanceId": args.attendance_id,
         "id": args.detail_id,
         "status": 1,
@@ -1347,9 +1480,20 @@ def _teacher_makeup_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "signRole": 3,
         "signUserId": args.student_id,
     }
+    location_values = (args.longitude, args.latitude, args.address)
+    if any(value is not None for value in location_values):
+        if not all(value is not None for value in location_values):
+            raise ApiError(-1, "补签定位信息必须同时提供 --longitude、--latitude 和 --address")
+        payload.update({
+            "signLongitude": args.longitude,
+            "signLatitude": args.latitude,
+            "signAddressName": args.address,
+        })
+    return payload
 
 
 def cmd_teacher_makeup(args: argparse.Namespace) -> None:
+    """使用教师权限为指定学生手动补签。"""
     payload = _teacher_makeup_payload(args)
     if args.dry_run:
         print("[DRY-RUN] 未发送请求，生成的教师补签参数：")
@@ -1389,6 +1533,68 @@ def cmd_auto_checkin(args: argparse.Namespace) -> None:
         raise ApiError(-1, str(exc)) from None
     if code != 0:
         raise ApiError(-1, "自动签到未能正常结束（详情见上方日志）")
+
+
+def cmd_force_checkin(args: argparse.Namespace) -> None:
+    """教师接口强制补签：学生账号 + 教师端考勤列表（详见 neumooc_checkin 模块）。"""
+    from neumooc_checkin import CheckinError, ForceCheckinBot
+
+    client = _build_client(args)
+    bot = ForceCheckinBot(
+        client,
+        interval=args.interval,
+        term_id=args.term_id,
+        course_ids=args.course_id,
+        longitude=args.longitude,
+        latitude=args.latitude,
+        address=args.address,
+        sign_type=args.sign_type,
+        refresh_seed=args.refresh_seed,
+        sign_role=args.sign_role,
+        teacher_fallback=not args.no_teacher_fallback,
+        teacher_user_id=args.teacher_user_id,
+        payload_style=args.payload_style,
+        skip_signed=not args.no_skip_signed,
+        reopen_ended=args.reopen_ended,
+        reopen_seconds=args.reopen_seconds,
+        sign_status=args.sign_status,
+        sign_time=_sign_time_argument(args.sign_time),
+        omit_sign_time=args.no_sign_time,
+        extra_fields=_json_argument(args.extra_fields, name="--extra-fields", object_only=True),
+        submit_path=args.submit_path,
+        include_ended=args.include_ended,
+        ended_within_minutes=args.ended_within,
+        dry_run=args.dry_run,
+        max_attempts=args.max_attempts,
+        max_rounds=1 if args.once else args.max_rounds,
+        page_size=args.page_size,
+        quiet=args.quiet,
+        verify=not args.no_verify,
+    )
+    try:
+        code = bot.run()
+    except CheckinError as exc:
+        raise ApiError(-1, str(exc)) from None
+    if code != 0:
+        raise ApiError(-1, "强制补签未能正常结束（详情见上方日志）")
+
+
+def _sign_time_argument(value: Optional[str]) -> Any:
+    """--sign-time：纯数字按毫秒时间戳，否则原样传给服务端（支持 'YYYY-MM-DD HH:MM:SS'）。"""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
+
+
+def cmd_courses(args: argparse.Namespace) -> None:
+    """列出本学期课程及其 teachCourseId（用于 --course-id）。"""
+    client = _build_client(args)
+    _print_courses(client, term_id=getattr(args, "term_id", None))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1483,13 +1689,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "teacher-makeup",
-        help="使用教师权限为指定学生补签（服务端校验教师权限）",
+        help="使用教师权限为指定学生强制补签（服务端校验教师权限）",
     )
     p.add_argument("--attendance-id", required=True, help="考勤活动 ID")
     p.add_argument("--detail-id", required=True, help="学生考勤明细 ID")
     p.add_argument("--student-id", required=True, help="目标学生用户 ID")
     p.add_argument("--type", type=int, choices=(0, 1, 2), default=0,
                    help="签到类型：0 普通，1 二维码，2 教师考勤（默认 0）")
+    p.add_argument("--longitude", help="补签经度（与纬度、地址同时提供）")
+    p.add_argument("--latitude", help="补签纬度（与经度、地址同时提供）")
+    p.add_argument("--address", help="补签地址（与经纬度同时提供）")
     p.add_argument("--dry-run", action="store_true", help="只打印参数，不实际补签")
     p.set_defaults(func=cmd_teacher_makeup)
 
@@ -1503,8 +1712,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-rounds", type=int, help="最多轮询轮数（默认不限，Ctrl+C 停止）")
     p.add_argument("--term-id", help="学期 ID（默认自动识别当前学期）")
     p.add_argument("--course-id", help="只关注指定课程（teachCourseId）")
-    p.add_argument("--longitude", help="定位签到经度（定位考勤必填）")
-    p.add_argument("--latitude", help="定位签到纬度（定位考勤必填）")
+    p.add_argument("--longitude", help="定位签到经度（缺省用默认学校坐标）")
+    p.add_argument("--latitude", help="定位签到纬度（缺省用默认学校坐标）")
     p.add_argument("--address", help="定位签到地址（可选，提交为 signAddressName）")
     p.add_argument("--qr-sign-type", type=int, choices=(0, 1), default=1,
                    help="二维码考勤(type=1)直接签到时的提交体 type 值（默认 1；"
@@ -1521,6 +1730,74 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只打印将要提交的签到数据，不实际提交")
     p.add_argument("--quiet", action="store_true", help="无考勤数据的轮次不打印日志")
     p.set_defaults(func=cmd_auto_checkin)
+
+    p = sub.add_parser(
+        "force-checkin",
+        help="教师接口强制补签：学生账号轮询教师端考勤列表并直签（EDU-03/教师考勤列表/ATT-03/05）",
+    )
+    p.add_argument("--interval", type=int, default=5,
+                   help="扫描间隔秒数（默认 5，最小 1）")
+    p.add_argument("--once", action="store_true", help="只扫描一轮即退出")
+    p.add_argument("--max-rounds", type=int, help="最多扫描轮数（默认不限，Ctrl+C 停止）")
+    p.add_argument("--term-id", help="学期 ID（默认自动识别当前学期）")
+    p.add_argument("--course-id", action="append", metavar="课程ID",
+                   help="只补签指定课程（可重复指定；不填则扫描该学期全部课程）")
+    p.add_argument("--longitude", help="签到经度（缺省用默认学校坐标）")
+    p.add_argument("--latitude", help="签到纬度（缺省用默认学校坐标）")
+    p.add_argument("--address", help="签到地址（缺省用默认学校坐标的地址）")
+    p.add_argument("--sign-type", type=int, choices=(0, 1), default=1,
+                   help="提交体 type（默认 1，走已验证的二维码直签通道）")
+    p.add_argument("--refresh-seed", help='伪造 refreshSeed（默认 "0"）')
+    p.add_argument("--sign-role", type=int, choices=(3, 4), default=4,
+                   help="提交体 signRole：4=学生签到形态（默认），3=教师手动修改形态"
+                        "（与 teacher-makeup 同形态，可改已结束的场次）")
+    p.add_argument("--no-teacher-fallback", action="store_true",
+                   help="学生形态被拒时不要自动改用教师形态重试")
+    p.add_argument("--teacher-user-id", metavar="用户ID",
+                   help="教师形态（signRole=3）用的 signUserId，即教师 user id；"
+                        "不填时尝试从考勤行的 teacherUserId/teacherId/createBy 等字段取")
+    p.add_argument("--reopen-ended", action="store_true",
+                   help="已结束场次补签：临时重开考勤窗口 → 补签 → 立即恢复（参考已验证做法）。"
+                        "注意：重开的那几十秒里该场对全班显示为「进行中」")
+    p.add_argument("--reopen-seconds", type=int, default=180, metavar="秒",
+                   help="临时重开的窗口秒数（默认 180）")
+    p.add_argument("--sign-status", type=int, default=1, metavar="状态",
+                   help="补签写入的考勤状态：1=出勤（默认）2=缺勤 3=事假 4=病假 5=迟到 6=早退")
+    p.add_argument("--no-sign-time", action="store_true",
+                   help="提交体不带 signTime（参考实现就是不带；被教师改过的记录带上可能被判"
+                        "「教师已手动修改您的签到状态」1020065006）")
+    p.add_argument("--sign-time", metavar="时间",
+                   help="补签写回的 signTime（毫秒时间戳或 'YYYY-MM-DD HH:MM:SS'）。"
+                        "不填则沿用该场原有的签到时间，不会记成「现在」")
+    p.add_argument("--no-skip-signed", action="store_true",
+                   help="不先拉本人考勤列表过滤已签场次（默认会跳过已签，避免重复提交）")
+    p.add_argument("--payload-style", choices=("full", "teacher"), default="full",
+                   help="提交体形态：full=App 直签（type=1+refreshSeed+坐标）；"
+                        "teacher=Web 教师端补签的最小字段集"
+                        "（仅 attendanceId/id/status/signRole/signUserId，可签已结束场次）")
+    p.add_argument("--extra-fields", metavar="JSON",
+                   help='额外并入提交体的字段，例如 \'{"signTime":"2026-09-14 08:00:00"}\'')
+    p.add_argument("--submit-path", metavar="路径",
+                   help="覆盖提交路由（默认 ATT-05 detail/update）；联调时填抓包得到的教师端路由")
+    p.add_argument("--include-ended", action="store_true",
+                   help="也尝试补签最近已结束的场次（注意：服务端直签接口会拒绝已结束"
+                        "场次并返回 1020065005「考勤已结束」，命中后自动跳过不再重试）")
+    p.add_argument("--ended-within", type=int, default=120, metavar="分钟",
+                   help="--include-ended 时只补签最近 N 分钟内结束的场次（默认 120）")
+    p.add_argument("--page-size", type=int, default=100,
+                   help="教师端考勤列表分页大小（默认 100）")
+    p.add_argument("--max-attempts", type=int, default=3,
+                   help="每场考勤失败重试次数上限（默认 3）")
+    p.add_argument("--no-verify", action="store_true",
+                   help="提交成功后不回读 ATT-02 校验")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只打印将要提交的补签数据，不实际提交")
+    p.add_argument("--quiet", action="store_true", help="无待补场次时不打印每轮日志")
+    p.set_defaults(func=cmd_force_checkin)
+
+    p = sub.add_parser("courses", help="列出本学期课程及其 teachCourseId（--course-id 要填的值）")
+    p.add_argument("--term-id", help="学期 ID（默认自动识别当前学期）")
+    p.set_defaults(func=cmd_courses)
 
     return parser
 
@@ -1550,4 +1827,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # 以脚本方式运行时，把 __main__ 注册为 neumooc_login。
+    # 否则 neumooc_checkin 里的 `from neumooc_login import ApiError` 会把这个
+    # 文件再加载一份，产生两个不同的 ApiError 类，所有 `except ApiError`
+    # 都匹配不上（表现为业务错误直接冒泡成“接口错误：[code] msg”）。
+    sys.modules.setdefault("neumooc_login", sys.modules["__main__"])
     sys.exit(main())
