@@ -7,6 +7,7 @@ from pathlib import Path
 from argparse import Namespace
 
 from neumooc_login import (
+    AUTH_REFRESH_BASE,
     DEFAULT_BUSINESS_BASE,
     LEGACY_BUSINESS_BASE,
     ApiError,
@@ -193,7 +194,8 @@ class NeumoocClientTests(unittest.TestCase):
         client.tenant_id = "123"
         client.http.responses = [
             FakeResponse(code=401, msg="token 过期"),      # 原始请求 401
-            FakeResponse(code=401, msg="refresh 失败"),    # 刷新 401
+            FakeResponse(code=401, msg="refresh 失败"),    # 刷新：业务域名
+            FakeResponse(code=401, msg="refresh 失败"),    # 刷新：AUTH_REFRESH_BASE 兜底
             FakeResponse({                                 # 凭据重新登录
                 "accessToken": "new-access",
                 "refreshToken": "new-refresh",
@@ -206,8 +208,12 @@ class NeumoocClientTests(unittest.TestCase):
         self.assertEqual(client.access_token, "new-access")
         self.assertEqual(client.user_id, "stu-1")
         urls = [u for _, u, _ in client.http.calls]
+        # 刷新会先打业务域名、再打 AUTH_REFRESH_BASE 兜底（两个域名各试一次）
         self.assertIn("/system/auth/app/refresh-token", urls[1])
-        self.assertIn("/system/auth/app/login", urls[2])
+        self.assertIn(DEFAULT_BUSINESS_BASE, urls[1])
+        self.assertIn("/system/auth/app/refresh-token", urls[2])
+        self.assertIn(AUTH_REFRESH_BASE, urls[2])
+        self.assertIn("/system/auth/app/login", urls[3])
 
     def test_401_without_credentials_clears_session_and_raises(self):
         client = self.make_client()  # 无凭据

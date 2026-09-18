@@ -74,6 +74,23 @@ WEB_API = "/web-api"
 DEFAULT_TOKEN_FILE = "neumooc_token.json"
 DEFAULT_CREDENTIAL_FILE = "neumooc_credentials.json"
 
+
+def _resolve_data_file(name: str) -> Path:
+    """默认数据文件（令牌/凭据）的定位。
+
+    先看当前工作目录，再看脚本所在目录。**必须两步都查**，否则从别的目录执行
+    `python D:\\...\\neumooc_login.py` 时找不到之前保存的 `neumooc_credentials.json`，
+    登录态一失效就无法自动重登，而且失败是静默的（只报 401 账号未登录）。
+    两个位置都没有时沿用旧行为（写入当前工作目录）。
+    """
+    cwd_file = Path.cwd() / name
+    if cwd_file.exists():
+        return cwd_file
+    script_file = Path(__file__).resolve().parent / name
+    if script_file.exists():
+        return script_file
+    return cwd_file
+
 # ---- 登录请求体字段名（文档标注“对象透传”，具体以联调为准）----
 USERNAME_KEY = "username"        # 密码登录账号字段，备选：account / mobile / studentNumber
 PASSWORD_KEY = "password"        # 密码登录密码字段
@@ -168,8 +185,11 @@ class NeumoocClient:
         self.debug = debug
         # (连接超时 5 秒, 读取超时)：网络不通时快速报错，避免界面长时间“卡死”
         self.timeout = (5.0, timeout)
-        self.token_file = Path(token_file or DEFAULT_TOKEN_FILE)
-        self.credential_file = Path(credential_file or DEFAULT_CREDENTIAL_FILE)
+        self.token_file = Path(token_file) if token_file else _resolve_data_file(DEFAULT_TOKEN_FILE)
+        self.credential_file = (
+            Path(credential_file) if credential_file
+            else _resolve_data_file(DEFAULT_CREDENTIAL_FILE)
+        )
 
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
@@ -507,39 +527,77 @@ class NeumoocClient:
     def refresh_access_token(self) -> Any:
         if not self.refresh_token:
             raise ApiError(-1, "本地没有 refreshToken，请先登录")
-        # 文档：刷新请求头仍包含旧访问令牌、租户 ID 和针对刷新路径生成的 Id-Code
-        url = f"{AUTH_REFRESH_BASE}{WEB_API}/system/auth/app/refresh-token"
-        data = self._request(
-            "POST",
-            url,
-            params={"refreshToken": self.refresh_token},
-            with_token=bool(self.access_token),
-            allow_refresh=False,
-        )
-        if isinstance(data, dict):
-            self._extract_tokens(data)
-        elif isinstance(data, str) and data:
-            self.access_token = data
-        if not self.access_token:
-            raise ApiError(
-                -1, "刷新返回 code=0，但未识别出访问令牌；请加 --debug 查看原始响应"
-            )
-        self.save_session()
-        return data
+        # 刷新必须打在**签发令牌的同一环境**上。历史上这里只打
+        # AUTH_REFRESH_BASE（studytest3），而业务域名是 study.neusoft.edu.cn，
+        # 结果一律返回「1010070005 租户不存在」，refresh 永远救不回来。
+        # 现在先试业务域名，再用常量兜底，并把最后一个错误抛出去。
+        hosts: List[str] = []
+        for candidate in (self.base, AUTH_REFRESH_BASE):
+            host = str(candidate or "").rstrip("/")
+            if host and host not in hosts:
+                hosts.append(host)
+        last_error: Optional[ApiError] = None
+        for host in hosts:
+            # 文档：刷新请求头仍包含旧访问令牌、租户 ID 和针对刷新路径生成的 Id-Code
+            url = f"{host}{WEB_API}/system/auth/app/refresh-token"
+            try:
+                data = self._request(
+                    "POST",
+                    url,
+                    params={"refreshToken": self.refresh_token},
+                    with_token=bool(self.access_token),
+                    allow_refresh=False,
+                )
+            except ApiError as exc:
+                last_error = exc
+                continue
+            if isinstance(data, dict):
+                self._extract_tokens(data)
+            elif isinstance(data, str) and data:
+                self.access_token = data
+            if not self.access_token:
+                last_error = ApiError(
+                    -1, "刷新返回 code=0，但未识别出访问令牌；请加 --debug 查看原始响应"
+                )
+                continue
+            self.save_session()
+            return data
+        raise last_error or ApiError(-1, "刷新访问令牌失败")
 
     def _relogin_with_credentials(self) -> bool:
-        """用保存的账号密码重新登录，成功返回 True。"""
+        """用保存的账号密码重新登录，成功返回 True。
+
+        失败时**必须打印原因**：这里静默返回 False 会让用户只看到
+        「401 账号未登录」而完全不知道是凭据文件没找到。
+        """
         creds = self.load_credentials()
         if not creds:
+            print(
+                f"[!] 自动重新登录失败：未找到凭据文件 {self.credential_file}。\n"
+                f"    解决：在你要运行本工具的目录下先执行一次\n"
+                f"      python neumooc_login.py login -u 学号 -p 密码 "
+                f"--save-credentials -t 租户ID\n"
+                f"    （或把已有的 {DEFAULT_CREDENTIAL_FILE} 放到当前目录）",
+                file=sys.stderr,
+            )
             return False
         username = creds.get("username")
         password = creds.get("password")
         if not username or password is None:
+            print(
+                f"[!] 自动重新登录失败：凭据文件 {self.credential_file} 缺少 "
+                f"username/password 字段。",
+                file=sys.stderr,
+            )
             return False
         tenant = creds.get("tenantId")
         try:
             self.login_with_password(str(username), str(password), tenant)
-        except (ApiError, requests.RequestException):
+        except (ApiError, requests.RequestException) as exc:
+            print(
+                f"[!] 自动重新登录失败（账号 {username}）：{exc}",
+                file=sys.stderr,
+            )
             return False
         print("[OK] 已通过保存的凭据自动重新登录")
         return True
@@ -1248,7 +1306,8 @@ def _build_client(args: argparse.Namespace) -> NeumoocClient:
     return NeumoocClient(
         website=getattr(args, "website", None),
         tenant_id=getattr(args, "tenant", None),
-        token_file=args.token_file,
+        token_file=getattr(args, "token_file", None),
+        credential_file=getattr(args, "credential_file", None),
         debug=args.debug,
         insecure=args.insecure,
         no_proxy=args.no_proxy,
@@ -1608,8 +1667,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--debug", action="store_true", help="打印原始请求/响应（令牌与密码脱敏）")
     parser.add_argument("--website", help=f"覆盖业务域名（默认 {DEFAULT_BUSINESS_BASE}）")
-    parser.add_argument("--token-file", default=DEFAULT_TOKEN_FILE,
-                        help=f"令牌缓存文件（默认 {DEFAULT_TOKEN_FILE}）")
+    parser.add_argument("--token-file", default=None,
+                        help=f"令牌缓存文件（默认 {DEFAULT_TOKEN_FILE}：当前目录优先，"
+                             f"其次脚本所在目录）")
+    parser.add_argument("--credential-file", default=None,
+                        help=f"凭据文件（默认 {DEFAULT_CREDENTIAL_FILE}：当前目录优先，"
+                             f"其次脚本所在目录）。登录态失效时用它自动重登。")
     parser.add_argument("--insecure", action="store_true", help="忽略 TLS 证书校验（测试环境排查用）")
     parser.add_argument("--no-proxy", action="store_true",
                         help="绕过系统/环境变量代理（请求长时间卡住时使用）")
